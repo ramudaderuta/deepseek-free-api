@@ -1,49 +1,81 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Image to GHCR
 
 on:
   release:
-    types: [created]
-  workflow_dispatch:
+    types: [created] # 触发器：当 release 创建时
+  workflow_dispatch: # 触发器：手动触发
     inputs:
       tag:
-        description: 'Tag Name'
+        description: 'Image Tag (e.g., v1.0.0, or specific identifier)' # 输入：手动指定标签
         required: true
+
+env:
+  # 设置目标仓库为 ghcr.io
+  REGISTRY: ghcr.io
+  # 设置镜像名称，通常是 ghcr.io/你的用户名或组织名/仓库名
+  # github.repository 会自动填充为 "用户名/仓库名"
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # --- 新增：授予写入 GitHub Packages (包含 ghcr.io) 的权限 ---
+    permissions:
+      contents: read   # 读取仓库内容权限 (用于 checkout)
+      packages: write  # 写入 Packages 权限 (用于推送 ghcr.io)
+    # --- 权限设置结束 ---
+
     steps:
-    - uses: actions/checkout@v3 # 推荐：更新 checkout action 版本
+    - name: Checkout repository
+      uses: actions/checkout@v4 # 更新 checkout action 版本
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3 # 推荐：更新 buildx action 版本
+      uses: docker/setup-buildx-action@v3 # 版本保持 v3 也可以，或更新到最新
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3 # 推荐：更新 login action 版本
+    # --- 修改：登录到 GHCR 而不是 Docker Hub ---
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3 # 版本保持 v3 也可以，或更新到最新
       with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_PASSWORD }}
+        registry: ${{ env.REGISTRY }}      # 使用 ghcr.io
+        username: ${{ github.actor }}      # 使用触发 workflow 的 GitHub 用户名
+        password: ${{ secrets.GITHUB_TOKEN }} # 使用自动生成的 GITHUB_TOKEN
+    # --- 登录步骤修改结束 ---
 
-    - name: Set tag name
-      id: tag_name
+    # --- 修改：构建用于 GHCR 的标签 ---
+    - name: Determine Image Tags
+      id: docker_tags
       run: |
         TAG=""
+        # 如果是 release 事件，使用 Git 标签
         if [ "${{ github.event_name }}" = "release" ]; then
+          # GITHUB_REF for tags is refs/tags/<tag_name>
           TAG="${GITHUB_REF#refs/tags/}"
+        # 如果是 workflow_dispatch 事件，使用输入的 tag
         elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           TAG="${{ github.event.inputs.tag }}"
         fi
-        echo "tag=$TAG" >> $GITHUB_OUTPUT # 使用 GITHUB_OUTPUT 设置输出
+
+        # 检查 TAG 是否为空
+        if [ -z "$TAG" ]; then
+          echo "Error: Tag could not be determined."
+          exit 1
+        fi
+
+        # 构建完整的 GHCR 镜像标签，并添加 latest 标签
+        # 格式: ghcr.io/owner/repo:tag,ghcr.io/owner/repo:latest
+        IMAGE_BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+        echo "tags=$(printf '%s\n' "${IMAGE_BASE}:${TAG}" "${IMAGE_BASE}:latest" | paste -sd ',')" >> $GITHUB_OUTPUT
+    # --- 标签确定步骤修改结束 ---
 
     - name: Build and push Docker image
-      uses: docker/build-push-action@v5 # 推荐：更新 build-push action 版本
+      uses: docker/build-push-action@v5 # 更新 build-push action 版本
       with:
         context: .
         file: ./Dockerfile
-        push: true
-        tags: |
-          vinlic/deepseek-free-api:${{ steps.tag_name.outputs.tag }}
-          vinlic/deepseek-free-api:latest
-        # 将 linux/arm/v7 添加到平台列表中
+        push: true # 在 release 或 dispatch 时总是推送
+        # --- 修改：使用上一步确定的 GHCR 标签 ---
+        tags: ${{ steps.docker_tags.outputs.tags }}
+        # --- 标签修改结束 ---
+        # 保持你需要的平台
         platforms: linux/amd64,linux/arm64,linux/arm/v7
-        # build-args: TARGETPLATFORM=${{ matrix.platform }} # 这行在这里通常不是必需的
+        # labels: 可以选择性地添加 labels，例如使用 docker/metadata-action (如下面的参考 workflow)
